@@ -1,143 +1,166 @@
-"""
-Phase 1: Improved Data Collector
-Enhancements based on our first test run
-"""
-
 import ccxt
 import pandas as pd
 import time
 import os
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from datetime import datetime
 
 load_dotenv()
 
 def initialize_exchange():
-    """Initialize Kraken exchange with better configuration"""
-    exchange = ccxt.kraken({
-        'apiKey': os.getenv('KRAKEN_API_KEY', ''),
-        'secret': os.getenv('KRAKEN_SECRET', ''),
-        'enableRateLimit': True,
-        'timeout': 30000,
-    })
-    
-    # Test the connection
+    """Initialize Kraken exchange connection"""
     try:
+        exchange = ccxt.kraken({
+            'apiKey': os.getenv('KRAKEN_API_KEY', ''),
+            'secret': os.getenv('KRAKEN_SECRET', ''),
+            'enableRateLimit': True,
+            'timeout': 30000,
+        })
+        
+        # Test connection by loading markets
         exchange.load_markets()
-        print("✓ Kraken exchange initialized and connected")
+        print("✓ Kraken exchange initialized successfully")
         return exchange
+        
     except Exception as e:
-        print(f"✗ Exchange connection failed: {e}")
+        print(f"✗ Failed to initialize exchange: {e}")
         return None
 
-def get_test_pairs():
-    # Expand to 3 pairs for better testing
-    return ['BTC/USD', 'ETH/USD', 'ADA/USD'] 
+def get_trading_pairs():
+    """Get the pairs we want to track"""
+    return ['BTC/USD', 'ETH/USD', 'ADA/USD', 'DOT/USD', 'LINK/USD']
 
-def fetch_ohlcv_safe(exchange, symbol, timeframe='1h', limit=100):
-    """Improved data fetching with better error handling"""
+def fetch_historical_data(exchange, symbol, days=180, timeframe='1h'):
+    """Fetch historical OHLCV data for a symbol"""
     try:
-        print(f"Fetching {symbol} {timeframe} data...")
+        print(f"📊 Fetching {days} days of {timeframe} data for {symbol}...")
         
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        # Calculate start time
+        since = exchange.parse8601((datetime.now() - timedelta(days=days)).isoformat())
         
-        if not ohlcv:
-            print(f"✗ No data returned for {symbol}")
+        all_ohlcv = []
+        current_since = since
+        
+        while True:
+            # Fetch data in chunks
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=current_since, limit=720)
+            
+            if not ohlcv or len(ohlcv) == 0:
+                break
+                
+            all_ohlcv.extend(ohlcv)
+            
+            # Update cursor for next request
+            current_since = ohlcv[-1][0] + 1  # Next millisecond after last candle
+            
+            # Check if we've reached current time or empty response
+            if len(ohlcv) < 720 or current_since > exchange.milliseconds():
+                break
+                
+            # Rate limiting
+            time.sleep(0.5)
+        
+        if not all_ohlcv:
+            print(f"✗ No data received for {symbol}")
             return None
             
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        # Create DataFrame
+        df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
         df['symbol'] = symbol
         
-        # Fix: Proper volume label
-        base_currency = symbol.split('/')[0]
-        df.rename(columns={'volume': f'volume_{base_currency}'}, inplace=True)
-        
-        print(f"✓ Retrieved {len(df)} candles for {symbol}")
+        print(f"✓ {symbol}: {len(df)} candles from {df.index.min()} to {df.index.max()}")
         return df
         
     except Exception as e:
-        print(f"✗ Error fetching {symbol}: {str(e)}")
+        print(f"✗ Error fetching {symbol}: {e}")
         return None
 
 def validate_data(df, symbol):
-    """Basic data validation checks"""
+    """Validate the quality of fetched data"""
     if df is None or df.empty:
         return False
         
     checks = {
-        'has_data': len(df) > 0,
+        'min_records': len(df) > 100,
         'no_nulls': not df[['open', 'high', 'low', 'close']].isnull().any().any(),
         'positive_prices': (df['close'] > 0).all(),
-        'time_gaps': df.index.to_series().diff().max().total_seconds() <= 7200,  # Max 2hr gap
+        'chronological_order': df.index.is_monotonic_increasing,
     }
     
-    if all(checks.values()):
-        return True
-    else:
-        print(f"  Data issues: {[k for k,v in checks.items() if not v]}")
+    failed_checks = [check for check, passed in checks.items() if not passed]
+    
+    if failed_checks:
+        print(f"  ⚠️  Validation failed for {symbol}: {failed_checks}")
         return False
+        
+    print(f"  ✅ Data validation passed for {symbol}")
+    return True
 
-def save_data(all_data):
-    """Save data to CSV files for later use"""
-    os.makedirs('data', exist_ok=True)
+def save_data(df, symbol, data_dir='data'):
+    """Save DataFrame to CSV file"""
+    os.makedirs(data_dir, exist_ok=True)
     
-    for symbol, df in all_data.items():
-        filename = f"data/{symbol.replace('/', '_')}.csv"
-        df.to_csv(filename)
-        print(f"  Saved to {filename}")
+    filename = f"{symbol.replace('/', '_')}.csv"
+    filepath = os.path.join(data_dir, filename)
     
-    print("✓ All data saved to 'data/' directory")
+    df.to_csv(filepath)
+    print(f"  💾 Saved {len(df)} records to {filepath}")
 
 def main():
-    print("=== Crypto Pairs Data Collector v2 ===\n")
+    print("=" * 50)
+    print("CRYPTO PAIRS DATA COLLECTOR v2")
+    print("=" * 50)
     
     # Initialize exchange
     exchange = initialize_exchange()
-    if exchange is None:
+    if not exchange:
         return
     
-    # Get test pairs
-    pairs = get_test_pairs()
-    print(f"Testing with pairs: {pairs}\n")
+    # Get trading pairs
+    pairs = get_trading_pairs()
+    print(f"\n🎯 Tracking {len(pairs)} pairs: {', '.join(pairs)}")
     
-    # Fetch data
-    all_data = {}
+    # Fetch data for each pair
     successful_pairs = []
     
     for pair in pairs:
-        data = fetch_ohlcv_safe(exchange, pair)
+        print(f"\n{'='*30}")
+        print(f"Processing {pair}")
+        print(f"{'='*30}")
         
-        if data is not None and validate_data(data, pair):
-            all_data[pair] = data
+        # Fetch historical data (180 days = ~6 months)
+        df = fetch_historical_data(exchange, pair, days=180, timeframe='1h')
+        
+        # Validate data
+        if validate_data(df, pair):
+            # Save to file
+            save_data(df, pair)
             successful_pairs.append(pair)
-        else:
-            print(f"✗ Validation failed for {pair}")
             
-        time.sleep(1)  # Rate limiting
-    
-    # Results summary
-    print(f"\n=== Results Summary ===")
-    print(f"Successful: {len(successful_pairs)}/{len(pairs)} pairs")
-    
-    for pair in successful_pairs:
-        df = all_data[pair]
-        base_currency = pair.split('/')[0]
-        volume_col = f'volume_{base_currency}'
+            # Show basic stats
+            print(f"  📈 Price: ${df['close'].iloc[-1]:.2f}")
+            print(f"  📊 Volume: {df['volume'].mean():.2f} {pair.split('/')[0]}/hour")
+        else:
+            print(f"  ❌ Skipping {pair} due to validation issues")
         
-        print(f"\n{pair}:")
-        print(f"  Period: {df.index.min()} to {df.index.max()}")
-        print(f"  Records: {len(df)}")
-        print(f"  Price: ${df['close'].iloc[-1]:.2f} (range: ${df['close'].min():.2f}-${df['close'].max():.2f})")
-        print(f"  Volume: {df[volume_col].mean():.2f} {base_currency}/hour")
+        # Rate limiting between pairs
+        time.sleep(1)
     
-    # Save data
-    if all_data:
-        print(f"\n=== Saving Data ===")
-        save_data(all_data)
+    # Summary
+    print(f"\n{'='*50}")
+    print("COLLECTION SUMMARY")
+    print(f"{'='*50}")
+    print(f"✅ Successful: {len(successful_pairs)}/{len(pairs)} pairs")
+    print(f"📁 Data saved to: data/ directory")
     
-    return all_data
+    if successful_pairs:
+        print(f"🎯 Pairs collected: {', '.join(successful_pairs)}")
+    else:
+        print("❌ No data was successfully collected")
+    
+    return successful_pairs
 
 if __name__ == "__main__":
-    data = main()
+    main()
